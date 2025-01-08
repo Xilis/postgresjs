@@ -3,7 +3,7 @@ const noop = () => { /* noop */ }
 
 export default function Subscribe(postgres, options) {
   const subscribers = new Map()
-      , slot = 'postgresjs_' + Math.random().toString(36).slice(2)
+      , slot = options.slot || ('postgresjs_' + Math.random().toString(36).slice(2))
       , state = {}
 
   let connection
@@ -49,16 +49,20 @@ export default function Subscribe(postgres, options) {
   return subscribe
 
   async function subscribe(event, fn, onsubscribe = noop, onerror = noop) {
+    // Parse the subscription pattern into standardized format (command:schema.table=key)
     event = parseEvent(event)
 
+    // Initialize connection if this is the first subscription
     if (!connection)
       connection = init(sql, slot, options.publications)
 
+    // Store the subscriber's callback function and onsubscribe handler
     const subscriber = { fn, onsubscribe }
     const fns = subscribers.has(event)
       ? subscribers.get(event).add(subscriber)
       : subscribers.set(event, new Set([subscriber])).get(event)
 
+    // Return function to remove this specific subscription
     const unsubscribe = () => {
       fns.delete(subscriber)
       fns.size === 0 && subscribers.delete(event)
@@ -82,12 +86,23 @@ export default function Subscribe(postgres, options) {
     if (!publications)
       throw new Error('Missing publication names')
 
-    const xs = await sql.unsafe(
-      `CREATE_REPLICATION_SLOT ${ slot } TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT`
-    )
+    let xs
+    if (slot.startsWith('postgresjs_')) {
+      // Create a new temporary replication slot and get its info
+      xs = await sql.unsafe(
+        `CREATE_REPLICATION_SLOT ${ slot } TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT`
+      )
+    } else {
+      // Look up existing replication slot
+      const slots = await sql.unsafe('SELECT confirmed_flush_lsn AS consistent_point FROM pg_replication_slots WHERE slot_name = $1', [slot])
+      if (!slots.length) throw new Error(`Replication slot "${slot}" does not exist`)
+      xs = slots
+    }
 
+    // Get the first (and only) slot info record
     const [x] = xs
 
+    // Start replication from the last confirmed position
     const stream = await sql.unsafe(
       `START_REPLICATION SLOT ${ slot } LOGICAL ${
         x.consistent_point
@@ -98,6 +113,7 @@ export default function Subscribe(postgres, options) {
       lsn: Buffer.concat(x.consistent_point.split('/').map(x => Buffer.from(('00000000' + x).slice(-8), 'hex')))
     }
 
+    // Set up stream handlers
     stream.on('data', data)
     stream.on('error', error)
     stream.on('close', sql.close)
@@ -109,16 +125,26 @@ export default function Subscribe(postgres, options) {
     }
 
     function data(x) {
-      if (x[0] === 0x77) {
+      if (x[0] === 0x77) { // 'w' - WAL data
+        // Parse the WAL data starting after the 25-byte header
         parse(x.subarray(25), state, sql.options.parsers, handle, options.transform)
-      } else if (x[0] === 0x6b && x[17]) {
+      } else if (x[0] === 0x6b && x[17]) { // 'k' - Keepalive message
+        // Update LSN and respond with pong
         state.lsn = x.subarray(1, 9)
         pong()
       }
     }
 
+    // Handle parsed WAL data by notifying relevant subscribers
     function handle(a, b) {
       const path = b.relation.schema + '.' + b.relation.table
+      // Notify subscribers using different patterns:
+      // - '*' for all changes
+      // - '*:schema.table' for all changes to a table
+      // - '*:schema.table=key' for all changes to a specific record
+      // - 'command' for specific operations (insert/update/delete)
+      // - 'command:schema.table' for specific operations on a table
+      // - 'command:schema.table=key' for specific operations on a record
       call('*', a, b)
       call('*:' + path, a, b)
       b.relation.keys.length && call('*:' + path + '=' + b.relation.keys.map(x => a[x.name]), a, b)
@@ -127,15 +153,17 @@ export default function Subscribe(postgres, options) {
       b.relation.keys.length && call(b.command + ':' + path + '=' + b.relation.keys.map(x => a[x.name]), a, b)
     }
 
+    // Respond to keepalive messages
     function pong() {
       const x = Buffer.alloc(34)
-      x[0] = 'r'.charCodeAt(0)
-      x.fill(state.lsn, 1)
-      x.writeBigInt64BE(BigInt(Date.now() - Date.UTC(2000, 0, 1)) * BigInt(1000), 25)
+      x[0] = 'r'.charCodeAt(0) // 'r' for reply
+      x.fill(state.lsn, 1)  // Copy LSN
+      x.writeBigInt64BE(BigInt(Date.now() - Date.UTC(2000, 0, 1)) * BigInt(1000), 25) // Current timestamp
       stream.write(x)
     }
   }
 
+  // Notify all subscribers for a given event pattern
   function call(x, a, b) {
     subscribers.has(x) && subscribers.get(x).forEach(({ fn }) => fn(a, b, x))
   }

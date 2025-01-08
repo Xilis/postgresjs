@@ -2580,3 +2580,59 @@ t('arrays in reserved connection', async() => {
     x.join('')
   ]
 })
+
+t('named subscription', { timeout: 4 }, async() => {
+  const sql = postgres({
+    database: 'postgres_js_test',
+    publications: 'alltables',
+    fetch_types: false
+  })
+
+  await sql.unsafe('create publication alltables for all tables')
+
+  const result = []
+  let onsubscribes = 0
+
+  // Create two subscribers using the same subscription name
+  const { unsubscribe: unsub1 } = await sql.subscribe(
+  '*', 
+    (row, { command }) => result.push('sub1', command, row.name || row.id),
+    () => onsubscribes++,
+    { name: 'test_sub' }
+  )
+
+  const { unsubscribe: unsub2 } = await sql.subscribe(
+    '*',
+    (row, { command }) => result.push('sub2', command, row.name || row.id),
+    () => onsubscribes++,
+    { name: 'test_sub' }
+  )
+
+  await sql`
+    create table test (
+      id serial primary key,
+      name text
+    )
+  `
+
+  await sql`insert into test (name) values ('Murray')`
+  await delay(10)
+
+  // Force a reconnection to verify subscription persists
+  await sql.end({ timeout: 0 })
+  await delay(500)
+
+  await sql`insert into test (name) values ('Rothbard')`
+  await delay(100)
+
+  await unsub1()
+  await unsub2()
+
+  return [
+    'sub1,insert,Murray,sub2,insert,Murray,sub1,insert,Rothbard,sub2,insert,Rothbard',
+    result.join(','),
+    await sql`drop table test`,
+    await sql`drop publication alltables`,
+    await sql.end()
+  ]
+})
